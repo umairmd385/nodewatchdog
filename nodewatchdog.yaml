@@ -1,14 +1,16 @@
 # Node watchdog: replaces worker nodes that stay NotReady/Unknown, so StatefulSets (Redis, Kafka, Jenkins)
-# are rescheduled in ~4 min without manual work. See README.md.
-# Before applying: replace REPLACE_ME_ROLE_ARN (terraform output node_watchdog_role_arn) and
-# CLUSTER_NAME / AWS_REGION in the CronJob if they differ.
+# are rescheduled in ~4-5 min without manual work. See README.md.
+# Before applying:
+#   1. Replace the role-arn annotation below with: terraform output node_watchdog_role_arn
+#   2. Set AWS_REGION in the CronJob to your cluster's region.
+# Ships with DRY_RUN=true. Set it to "false" only after reading the logs for a day.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: node-watchdog
   namespace: kube-system
   annotations:
-    eks.amazonaws.com/role-arn: <aws-eks-node-arn>
+    eks.amazonaws.com/role-arn: arn:aws:iam::REPLACE_ME_ACCOUNT_ID:role/REPLACE_ME_ROLE_NAME
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -18,12 +20,15 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
     verbs: ["get", "list", "patch", "delete"]
   - apiGroups: ["karpenter.sh"]
     resources: ["nodeclaims"]
-    verbs: ["get", "list", "delete"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -46,24 +51,57 @@ metadata:
 data:
   watchdog.sh: |
     #!/bin/sh
-    # Safety rules: act on at most ONE node per run; do nothing if more than MAX_UNHEALTHY nodes are
-    # unhealthy at once (that points at a network/control-plane problem, not a dead node); the
-    # out-of-service taint is only added after AWS confirms the instance is going away (avoids split-brain
-    # writes to an EBS volume).
+    # Safety rules:
+    #  - act on at most ONE node per run;
+    #  - do nothing if more than MAX_UNHEALTHY nodes are unhealthy at once (that points at a
+    #    network/control-plane problem, not a dead node);
+    #  - the out-of-service taint is only added after AWS confirms the instance is stopped/going away
+    #    (avoids split-brain writes to an EBS volume);
+    #  - any AWS/Kubernetes call that fails unexpectedly makes the script skip or abort, never "assume gone".
     set -eu
     NOT_READY_SECONDS="${NOT_READY_SECONDS:-180}"
     MAX_UNHEALTHY="${MAX_UNHEALTHY:-1}"
-    DRY_RUN="${DRY_RUN:-false}"
+    DRY_RUN="${DRY_RUN:-true}"
+    OOS_TAINT="node.kubernetes.io/out-of-service"
 
     # --- Orphaned EBS attachments -------------------------------------------------------------------
     # A VolumeAttachment whose node no longer exists can never be unmounted by a kubelet, so it only blocks the
     # replacement pod ("Volume is already exclusively attached to one node"). Delete it so the CSI attacher
-    # detaches the volume from EC2. Attachments of nodes that still exist are never touched here.
+    # detaches the volume from EC2. Attachments of nodes that still exist are never touched, and an attachment
+    # is only removed when AWS shows the volume is not attached to a live instance.
+    # Order matters: list attachments FIRST, then nodes, so a node that joins in between is never mistaken
+    # for a missing one.
+    vas=$(kubectl get volumeattachments -o json)
     nodes=$(kubectl get nodes -o name | sed 's|node/||')
-    kubectl get volumeattachments -o json | jq -r '.items[] | [.metadata.name, .spec.nodeName, (.metadata.deletionTimestamp // "")] | @tsv' |
-    while IFS="$(printf '\t')" read -r va vnode deleting; do
-      echo "$nodes" | grep -qx "$vnode" && continue
-      echo "orphan VolumeAttachment $va (node $vnode gone)"
+    if [ -z "$nodes" ]; then
+      echo "ABORT: node list is empty (API problem?), refusing to touch VolumeAttachments"
+      exit 1
+    fi
+    printf '%s' "$vas" | jq -r '.items[] | select(.spec.nodeName != null) |
+        [.metadata.name, .spec.nodeName, (.metadata.deletionTimestamp // ""), (.spec.source.persistentVolumeName // "")] | join("|")' |
+    while IFS='|' read -r va vnode deleting pvname; do
+      printf '%s\n' "$nodes" | grep -qxF "$vnode" && continue
+      vol=""
+      [ -n "$pvname" ] && vol=$(kubectl get pv "$pvname" -o jsonpath='{.spec.csi.volumeHandle}' 2>/dev/null || true)
+      if [ -z "$vol" ]; then
+        echo "skip $va: cannot resolve the EBS volume id"
+        continue
+      fi
+      if ! inst=$(aws ec2 describe-volumes --volume-ids "$vol" --query 'Volumes[0].Attachments[0].InstanceId' --output text 2>/dev/null); then
+        echo "skip $va: describe-volumes failed for $vol"
+        continue
+      fi
+      if [ "$inst" != "None" ]; then
+        if ! st=$(aws ec2 describe-instances --instance-ids "$inst" --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null); then
+          echo "skip $va: cannot read state of $inst"
+          continue
+        fi
+        case "$st" in
+          stopped|terminated) ;;
+          *) echo "skip $va: volume $vol still attached to $inst ($st)"; continue ;;
+        esac
+      fi
+      echo "orphan VolumeAttachment $va (node $vnode gone, volume $vol not attached to a live instance)"
       [ "$DRY_RUN" = "true" ] && continue
       kubectl delete volumeattachment "$va" --wait=false || true
       # already terminating but stuck on its finalizer: the node is gone, nothing can finish the unmount
@@ -72,6 +110,7 @@ data:
       fi
     done
 
+    # --- Dead nodes -----------------------------------------------------------------------------------
     bad=$(kubectl get nodes -o json | jq -r --argjson t "$NOT_READY_SECONDS" '
       .items[]
       | . as $n
@@ -81,7 +120,7 @@ data:
       | $n.metadata.name')
     [ -z "$bad" ] && { echo "all nodes healthy"; exit 0; }
 
-    count=$(echo "$bad" | wc -l)
+    count=$(printf '%s\n' "$bad" | wc -l)
     if [ "$count" -gt "$MAX_UNHEALTHY" ]; then
       echo "ABORT: $count nodes unhealthy (> $MAX_UNHEALTHY); refusing to act automatically: $bad"
       exit 1
@@ -91,28 +130,47 @@ data:
     echo "node $node NotReady > ${NOT_READY_SECONDS}s"
     pid=$(kubectl get node "$node" -o jsonpath='{.spec.providerID}')
     iid="${pid##*/}"
+    case "$iid" in i-*) ;; *) echo "ABORT: cannot derive instance id from providerID '$pid'"; exit 1 ;; esac
     [ "$DRY_RUN" = "true" ] && { echo "DRY_RUN: would replace $node ($iid)"; exit 0; }
 
-    state=$(aws ec2 describe-instances --instance-ids "$iid" --query 'Reservations[0].Instances[0].State.Name' --output text)
+    # An instance that has been terminated for ~1h disappears from the API: that means "gone".
+    # Any other error (throttling, permissions) must NOT be read as "gone", or we could fence a live node.
+    if out=$(aws ec2 describe-instances --instance-ids "$iid" --query 'Reservations[0].Instances[0].State.Name' --output text 2>&1); then
+      state="$out"
+    elif printf '%s' "$out" | grep -q 'InvalidInstanceID.NotFound'; then
+      state="terminated"
+    else
+      echo "ABORT: describe-instances failed: $out"
+      exit 1
+    fi
     echo "instance $iid state: $state"
 
-    if [ "$state" = "running" ] || [ "$state" = "pending" ] || [ "$state" = "stopping" ]; then
-      claim=$(kubectl get nodeclaims -o json 2>/dev/null | jq -r --arg n "$node" '.items[]|select(.status.nodeName==$n)|.metadata.name' || true)
-      if [ -n "$claim" ]; then
-        echo "Karpenter node: deleting nodeclaim $claim"
-        kubectl delete nodeclaim "$claim" --wait=false
-      else
-        echo "Managed node group: terminating $iid and letting the ASG launch a replacement"
-        aws autoscaling terminate-instance-in-auto-scaling-group --instance-id "$iid" --no-should-decrement-desired-capacity
-      fi
-      echo "termination requested; next run will fence and clean up"
-      exit 0
-    fi
+    case "$state" in
+      running|pending|stopping)
+        # Terminate the instance directly, for Karpenter nodes too: a NodeClaim delete would first try to drain a
+        # node whose kubelet is dead (pods stay Terminating) and wait for volume detachment, so it can hang.
+        # Karpenter notices the instance is gone and removes the NodeClaim by itself.
+        if aws autoscaling terminate-instance-in-auto-scaling-group --instance-id "$iid" --no-should-decrement-desired-capacity 2>/dev/null; then
+          echo "managed node group: ASG terminated $iid and will launch a replacement"
+        else
+          echo "not in an ASG (Karpenter or standalone): terminating $iid directly"
+          aws ec2 terminate-instances --instance-ids "$iid" >/dev/null
+        fi
+        echo "termination requested; next runs will fence and clean up"
+        exit 0
+        ;;
+    esac
 
-    # instance is shutting-down / terminated: the node can no longer write to its volumes
-    echo "instance gone: fencing node (out-of-service taint) and removing node object"
-    kubectl taint node "$node" node.kubernetes.io/out-of-service=nodeshutdown:NoExecute --overwrite || true
-    kubectl delete node "$node" --wait=false
+    # stopped / shutting-down / terminated: the node can no longer write to its volumes.
+    # Step 1 (this run): add the out-of-service taint so pods are force-deleted and volumes force-detached.
+    # Step 2 (a later run): delete the Node object once the taint has had time to work.
+    if kubectl get node "$node" -o json | jq -e --arg k "$OOS_TAINT" '[.spec.taints[]? | select(.key==$k)] | length > 0' >/dev/null; then
+      echo "taint already present: removing node object $node"
+      kubectl delete node "$node" --wait=false
+    else
+      echo "instance gone: fencing $node with $OOS_TAINT"
+      kubectl taint node "$node" "$OOS_TAINT=nodeshutdown:NoExecute" --overwrite
+    fi
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -133,6 +191,15 @@ spec:
           serviceAccountName: node-watchdog
           restartPolicy: Never
           priorityClassName: system-cluster-critical
+          # Prefer a stable (non-Karpenter) node so the watchdog is not itself on a node it may have to replace.
+          # "Preferred", not "required": on a Karpenter-only cluster it must still be schedulable.
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  preference:
+                    matchExpressions:
+                      - { key: karpenter.sh/nodepool, operator: DoesNotExist }
           # Must be able to run when a node is dead
           tolerations:
             - {
@@ -152,9 +219,10 @@ spec:
               image: alpine/k8s:1.33.4
               command: ["/bin/sh", "/scripts/watchdog.sh"]
               env:
-                - { name: AWS_REGION, value: us-east-1 }
+                - { name: AWS_REGION, value: us-east-1 } # set to your cluster's region
                 - { name: NOT_READY_SECONDS, value: "180" }
-                - { name: DRY_RUN, value: "false" }
+                - { name: MAX_UNHEALTHY, value: "1" }
+                - { name: DRY_RUN, value: "true" } # set to "false" only after a day of clean dry-run logs
               resources:
                 requests: { cpu: 10m, memory: 32Mi }
                 limits: { memory: 128Mi }
