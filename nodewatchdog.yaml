@@ -1,0 +1,165 @@
+# Node watchdog: replaces worker nodes that stay NotReady/Unknown, so StatefulSets (Redis, Kafka, Jenkins)
+# are rescheduled in ~4 min without manual work. See README.md.
+# Before applying: replace REPLACE_ME_ROLE_ARN (terraform output node_watchdog_role_arn) and
+# CLUSTER_NAME / AWS_REGION in the CronJob if they differ.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-watchdog
+  namespace: kube-system
+  annotations:
+    eks.amazonaws.com/role-arn: <aws-eks-node-arn>
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: node-watchdog
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "patch", "delete"]
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodeclaims"]
+    verbs: ["get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: node-watchdog
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: node-watchdog
+subjects:
+  - kind: ServiceAccount
+    name: node-watchdog
+    namespace: kube-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: node-watchdog-script
+  namespace: kube-system
+data:
+  watchdog.sh: |
+    #!/bin/sh
+    # Safety rules: act on at most ONE node per run; do nothing if more than MAX_UNHEALTHY nodes are
+    # unhealthy at once (that points at a network/control-plane problem, not a dead node); the
+    # out-of-service taint is only added after AWS confirms the instance is going away (avoids split-brain
+    # writes to an EBS volume).
+    set -eu
+    NOT_READY_SECONDS="${NOT_READY_SECONDS:-180}"
+    MAX_UNHEALTHY="${MAX_UNHEALTHY:-1}"
+    DRY_RUN="${DRY_RUN:-false}"
+
+    # --- Orphaned EBS attachments -------------------------------------------------------------------
+    # A VolumeAttachment whose node no longer exists can never be unmounted by a kubelet, so it only blocks the
+    # replacement pod ("Volume is already exclusively attached to one node"). Delete it so the CSI attacher
+    # detaches the volume from EC2. Attachments of nodes that still exist are never touched here.
+    nodes=$(kubectl get nodes -o name | sed 's|node/||')
+    kubectl get volumeattachments -o json | jq -r '.items[] | [.metadata.name, .spec.nodeName, (.metadata.deletionTimestamp // "")] | @tsv' |
+    while IFS="$(printf '\t')" read -r va vnode deleting; do
+      echo "$nodes" | grep -qx "$vnode" && continue
+      echo "orphan VolumeAttachment $va (node $vnode gone)"
+      [ "$DRY_RUN" = "true" ] && continue
+      kubectl delete volumeattachment "$va" --wait=false || true
+      # already terminating but stuck on its finalizer: the node is gone, nothing can finish the unmount
+      if [ -n "$deleting" ]; then
+        kubectl patch volumeattachment "$va" --type=merge -p '{"metadata":{"finalizers":null}}' || true
+      fi
+    done
+
+    bad=$(kubectl get nodes -o json | jq -r --argjson t "$NOT_READY_SECONDS" '
+      .items[]
+      | . as $n
+      | ($n.status.conditions[] | select(.type=="Ready")) as $c
+      | select($c.status != "True")
+      | select((now - ($c.lastTransitionTime | fromdateiso8601)) > $t)
+      | $n.metadata.name')
+    [ -z "$bad" ] && { echo "all nodes healthy"; exit 0; }
+
+    count=$(echo "$bad" | wc -l)
+    if [ "$count" -gt "$MAX_UNHEALTHY" ]; then
+      echo "ABORT: $count nodes unhealthy (> $MAX_UNHEALTHY); refusing to act automatically: $bad"
+      exit 1
+    fi
+
+    node="$bad"
+    echo "node $node NotReady > ${NOT_READY_SECONDS}s"
+    pid=$(kubectl get node "$node" -o jsonpath='{.spec.providerID}')
+    iid="${pid##*/}"
+    [ "$DRY_RUN" = "true" ] && { echo "DRY_RUN: would replace $node ($iid)"; exit 0; }
+
+    state=$(aws ec2 describe-instances --instance-ids "$iid" --query 'Reservations[0].Instances[0].State.Name' --output text)
+    echo "instance $iid state: $state"
+
+    if [ "$state" = "running" ] || [ "$state" = "pending" ] || [ "$state" = "stopping" ]; then
+      claim=$(kubectl get nodeclaims -o json 2>/dev/null | jq -r --arg n "$node" '.items[]|select(.status.nodeName==$n)|.metadata.name' || true)
+      if [ -n "$claim" ]; then
+        echo "Karpenter node: deleting nodeclaim $claim"
+        kubectl delete nodeclaim "$claim" --wait=false
+      else
+        echo "Managed node group: terminating $iid and letting the ASG launch a replacement"
+        aws autoscaling terminate-instance-in-auto-scaling-group --instance-id "$iid" --no-should-decrement-desired-capacity
+      fi
+      echo "termination requested; next run will fence and clean up"
+      exit 0
+    fi
+
+    # instance is shutting-down / terminated: the node can no longer write to its volumes
+    echo "instance gone: fencing node (out-of-service taint) and removing node object"
+    kubectl taint node "$node" node.kubernetes.io/out-of-service=nodeshutdown:NoExecute --overwrite || true
+    kubectl delete node "$node" --wait=false
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: node-watchdog
+  namespace: kube-system
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 0 # succeeded jobs and their pods are deleted right away
+  failedJobsHistoryLimit: 1 # keep only the latest failure so its logs can be read
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 120
+      template:
+        spec:
+          serviceAccountName: node-watchdog
+          restartPolicy: Never
+          priorityClassName: system-cluster-critical
+          # Must be able to run when a node is dead
+          tolerations:
+            - {
+                key: node.kubernetes.io/unreachable,
+                operator: Exists,
+                effect: NoExecute,
+                tolerationSeconds: 30,
+              }
+            - {
+                key: node.kubernetes.io/not-ready,
+                operator: Exists,
+                effect: NoExecute,
+                tolerationSeconds: 30,
+              }
+          containers:
+            - name: watchdog
+              image: alpine/k8s:1.33.4
+              command: ["/bin/sh", "/scripts/watchdog.sh"]
+              env:
+                - { name: AWS_REGION, value: us-east-1 }
+                - { name: NOT_READY_SECONDS, value: "180" }
+                - { name: DRY_RUN, value: "false" }
+              resources:
+                requests: { cpu: 10m, memory: 32Mi }
+                limits: { memory: 128Mi }
+              volumeMounts:
+                - { name: script, mountPath: /scripts }
+          volumes:
+            - name: script
+              configMap: { name: node-watchdog-script }
